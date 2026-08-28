@@ -1,0 +1,6 @@
+{
+  "name": "CardioVision",
+  "description": "AI-Based Cardiovascular Risk Screening Using Facial Video and Multi-Method rPPG",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
