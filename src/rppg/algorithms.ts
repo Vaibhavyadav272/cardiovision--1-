@@ -1099,12 +1099,25 @@ export function evaluateROIQuality(samples: RGBSample[]): ROIQualityBreakdown {
   if (rightCheek >= 50) selectedROIs.push("Right Cheek");
 
   /*
-   * Overall quality is weighted toward forehead because it generally offers
-   * a useful vascular region, but its score is still measured from the signal.
+   * Overall ROI quality is an unbiased summary of the measured ROI qualities.
+   *
+   * IMPORTANT:
+   * There is NO fixed 44% forehead / 28% cheek weighting here.
+   * The actual Multi-ROI waveform fusion below uses each ROI's measured
+   * quality as its dynamic weight.
    */
-  const overall = Math.round(
-    0.44 * forehead + 0.28 * leftCheek + 0.28 * rightCheek,
-  );
+  const roiScores = [
+    Math.max(0, forehead),
+    Math.max(0, leftCheek),
+    Math.max(0, rightCheek),
+  ];
+
+  const overall =
+    roiScores.length > 0
+      ? Math.round(
+          roiScores.reduce((sum, score) => sum + score, 0) / roiScores.length,
+        )
+      : 0;
 
   return {
     forehead,
@@ -1112,6 +1125,40 @@ export function evaluateROIQuality(samples: RGBSample[]): ROIQualityBreakdown {
     rightCheek,
     overall,
     selectedROIs,
+  };
+}
+
+/**
+ * Calculate dynamic Multi-ROI weights from measured ROI quality.
+ *
+ * The returned percentages always sum to 100 when at least one ROI has
+ * positive quality. No fixed forehead/cheek weighting is used.
+ */
+export function calculateAdaptiveROIWeights(roiQuality: ROIQualityBreakdown): {
+  forehead: number;
+  leftCheek: number;
+  rightCheek: number;
+} {
+  const raw = {
+    forehead: Math.max(0, roiQuality.forehead),
+    leftCheek: Math.max(0, roiQuality.leftCheek),
+    rightCheek: Math.max(0, roiQuality.rightCheek),
+  };
+
+  const total = raw.forehead + raw.leftCheek + raw.rightCheek;
+
+  if (total <= 0) {
+    return {
+      forehead: 0,
+      leftCheek: 0,
+      rightCheek: 0,
+    };
+  }
+
+  return {
+    forehead: Number(((raw.forehead / total) * 100).toFixed(1)),
+    leftCheek: Number(((raw.leftCheek / total) * 100).toFixed(1)),
+    rightCheek: Number(((raw.rightCheek / total) * 100).toFixed(1)),
   };
 }
 
