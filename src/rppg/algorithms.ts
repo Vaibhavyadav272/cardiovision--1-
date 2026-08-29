@@ -6,11 +6,11 @@ import {
   RiskLevel,
   ConfidenceTier,
   DecisionOutcome,
-  TemporalStabilityStatus,
   ROIQualityBreakdown,
   QualityTimelineInterval,
   WindowAnalysisPoint,
-} from '../types';
+} from "../types";
+
 import {
   detrend,
   normalizeSignal,
@@ -21,331 +21,885 @@ import {
   computeWaveformQuality,
   computeSlidingWindowRPPG,
   computeTemporalStability,
-} from './signalProcessing';
+} from "./signalProcessing";
 
-/**
- * 1. G-Channel rPPG Algorithm
- * Hemoglobin strongly absorbs 500-600nm green light.
+/*
+ * ============================================================================
+ * CardioVision rPPG Algorithm Engine
+ * ============================================================================
+ *
+ * Four methods:
+ *   1. G-Channel
+ *   2. CHROM
+ *   3. POS
+ *   4. Multi-ROI adaptive fusion
+ *
+ * Design goals:
+ *   - No reference BPM is used anywhere.
+ *   - No method is forced toward a target value.
+ *   - No artificial SNR offsets are added.
+ *   - Poor signal quality is allowed to produce an unreliable/zero result.
+ *   - ROI weights are driven by measured signal quality rather than fixed
+ *     "forehead = X%" assumptions.
+ *
+ * Important:
+ * The final BPM is still only an rPPG estimate. Webcam rPPG cannot guarantee
+ * 100% clinical accuracy. The validation engine therefore favors rejection
+ * over presenting a precise-looking number when evidence is weak.
+ * ============================================================================
  */
-export function processGMethod(samples: RGBSample[], sampleRate: number): MethodResult {
-  const gRaw = samples.map((s) => s.g);
-  const detrended = detrend(gRaw, Math.round(sampleRate * 0.8));
-  const filtered = bandpassFilter(detrended, sampleRate, 0.7, 3.8);
-  // Invert because higher blood volume = higher light absorption = lower reflection
-  const inverted = filtered.map((v) => -v);
-  const normalized = normalizeSignal(inverted);
 
-  const spectrum = computeFFT(normalized, sampleRate);
-  const { bpm, snrDb, peaks } = estimateHeartRate(normalized, sampleRate, spectrum);
-  const confidence = Math.min(0.99, Math.max(0.05, 0.35 + snrDb / 20));
+const MIN_BPM = 45;
+const MAX_BPM = 180;
+const MIN_HZ = MIN_BPM / 60;
+const MAX_HZ = MAX_BPM / 60;
 
-  const peakConsistency = computePeakConsistency(peaks, sampleRate);
-  const waveformQuality = computeWaveformQuality(normalized, snrDb);
-  const windows = computeSlidingWindowRPPG(normalized, sampleRate, 10, 5);
-  const temporal = computeTemporalStability(windows);
+const MIN_SAMPLES = 4 * 30;
+const CARDIAC_LOW = 0.7;
+const CARDIAC_HIGH = 3.0;
 
+/* -------------------------------------------------------------------------- */
+/* Utility helpers                                                            */
+/* -------------------------------------------------------------------------- */
+
+function emptyMethodResult(description: string, snrDb = -20): MethodResult {
   return {
-    bpm,
-    snrDb: parseFloat(snrDb.toFixed(1)),
-    confidence: parseFloat(confidence.toFixed(2)),
-    waveform: normalized,
-    peaks,
-    detectedPulsePeaks: peaks.length,
-    peakConsistency,
-    waveformQuality,
-    temporalStability: temporal.score,
-    spectrum,
-    description: 'Green channel optical absorption (HbO2 baseline)',
+    bpm: 0,
+    snrDb,
+    confidence: 0.05,
+    waveform: [],
+    peaks: [],
+    detectedPulsePeaks: 0,
+    peakConsistency: 20,
+    waveformQuality: 15,
+    temporalStability: 15,
+    spectrum: [],
+    description,
   };
 }
 
-/**
- * 2. CHROM rPPG Algorithm (de Haan & Jeanne, 2013)
- * Chrominance-based method eliminating specular reflection and skin tone artifacts
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function mean(values: number[]): number {
+  if (!values.length) return 0;
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+function standardDeviation(values: number[]): number {
+  if (values.length < 2) return 0;
+  const m = mean(values);
+  return Math.sqrt(
+    values.reduce((sum, value) => sum + (value - m) ** 2, 0) / values.length,
+  );
+}
+
+function median(values: number[]): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+}
+
+function percentile(values: number[], p: number): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = clamp((sorted.length - 1) * p, 0, sorted.length - 1);
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (index - lower);
+}
+
+function safeNormalize(values: number[]): number[] {
+  if (!values.length) return [];
+  const sd = standardDeviation(values);
+  if (!Number.isFinite(sd) || sd < 1e-10) {
+    return values.map(() => 0);
+  }
+  const m = mean(values);
+  return values.map((v) => (v - m) / sd);
+}
+
+/*
+ * Convert the supplied samples to a stable effective sample rate.
+ *
+ * The acquisition layer may provide timestamps that are not exactly 30 FPS.
+ * We use the timestamps when they are valid. This prevents a hard-coded
+ * 30-FPS assumption from silently scaling the frequency axis.
  */
-export function processChromMethod(samples: RGBSample[], sampleRate: number): MethodResult {
-  const n = samples.length;
-  const r = samples.map((s) => s.r);
-  const g = samples.map((s) => s.g);
-  const b = samples.map((s) => s.b);
+function effectiveSampleRate(samples: RGBSample[], fallback = 30): number {
+  if (samples.length < 3) return fallback;
 
-  // Mean normalization
-  const meanR = r.reduce((a, c) => a + c, 0) / n || 1;
-  const meanG = g.reduce((a, c) => a + c, 0) / n || 1;
-  const meanB = b.reduce((a, c) => a + c, 0) / n || 1;
+  const timestamps = samples
+    .map((s) => Number(s.timestamp))
+    .filter(Number.isFinite);
 
-  const rn = r.map((v) => v / meanR);
-  const gn = g.map((v) => v / meanG);
-  const bn = b.map((v) => v / meanB);
+  if (timestamps.length !== samples.length) return fallback;
 
-  // Chrominance signals: Xs = 3Rn - 2Gn, Ys = 1.5Rn + Gn - 1.5Bn
-  const xs: number[] = new Array(n);
-  const ys: number[] = new Array(n);
-
-  for (let i = 0; i < n; i++) {
-    xs[i] = 3 * rn[i] - 2 * gn[i];
-    ys[i] = 1.5 * rn[i] + gn[i] - 1.5 * bn[i];
+  const intervals: number[] = [];
+  for (let i = 1; i < timestamps.length; i++) {
+    const dt = (timestamps[i] - timestamps[i - 1]) / 1000;
+    if (dt > 0 && dt < 1) intervals.push(dt);
   }
 
-  // Bandpass filter Xs and Ys before projection
-  const xsFiltered = bandpassFilter(detrend(xs), sampleRate, 0.7, 3.8);
-  const ysFiltered = bandpassFilter(detrend(ys), sampleRate, 0.7, 3.8);
+  if (intervals.length < 2) return fallback;
 
-  // Standard deviation calculation
-  const stdX = Math.sqrt(xsFiltered.reduce((a, c) => a + c * c, 0) / n) || 1e-6;
-  const stdY = Math.sqrt(ysFiltered.reduce((a, c) => a + c * c, 0) / n) || 1e-6;
-  const alpha = stdX / stdY;
+  /*
+   * Median inter-frame interval is robust to a few dropped/duplicated frames.
+   */
+  const dt = median(intervals);
+  const rate = 1 / dt;
 
-  // Pulse signal S = Xs - alpha * Ys
-  const sRaw = xsFiltered.map((x, i) => x - alpha * ysFiltered[i]);
-  const sFiltered = bandpassFilter(sRaw, sampleRate, 0.7, 3.8);
-  const normalized = normalizeSignal(sFiltered);
-
-  const spectrum = computeFFT(normalized, sampleRate);
-  const { bpm, snrDb, peaks } = estimateHeartRate(normalized, sampleRate, spectrum);
-  const effectiveSnr = Math.min(24, snrDb + 1.2);
-  const confidence = Math.min(0.99, Math.max(0.05, 0.3 + effectiveSnr / 18));
-
-  const peakConsistency = computePeakConsistency(peaks, sampleRate);
-  const waveformQuality = computeWaveformQuality(normalized, effectiveSnr);
-  const windows = computeSlidingWindowRPPG(normalized, sampleRate, 10, 5);
-  const temporal = computeTemporalStability(windows);
-
-  return {
-    bpm,
-    snrDb: parseFloat(effectiveSnr.toFixed(1)),
-    confidence: parseFloat(confidence.toFixed(2)),
-    waveform: normalized,
-    peaks,
-    detectedPulsePeaks: peaks.length,
-    peakConsistency,
-    waveformQuality,
-    temporalStability: temporal.score,
-    spectrum,
-    description: 'Chrominance-based projection invariant to illumination color changes',
-  };
+  return Number.isFinite(rate) && rate >= 10 && rate <= 60 ? rate : fallback;
 }
 
-/**
- * 3. POS rPPG Algorithm (Wang et al., 2017)
- * Plane-Orthogonal-to-Skin algorithm projecting RGB onto a subspace orthogonal to skin tone
+/*
+ * Remove invalid numeric samples without changing array length.
+ * Invalid samples are replaced by the nearest valid value.
  */
-export function processPosMethod(samples: RGBSample[], sampleRate: number): MethodResult {
-  const n = samples.length;
-  const r = samples.map((s) => s.r);
-  const g = samples.map((s) => s.g);
-  const b = samples.map((s) => s.b);
+function sanitizeSignal(signal: number[]): number[] {
+  if (!signal.length) return [];
 
-  const windowSize = Math.min(n, Math.round(sampleRate * 1.6));
-  const halfWin = Math.floor(windowSize / 2);
-  const sPos: number[] = new Array(n).fill(0);
+  const result = signal.map((v) => (Number.isFinite(v) ? v : NaN));
 
-  // Temporal sliding window normalization
-  for (let i = 0; i < n; i++) {
-    const start = Math.max(0, i - halfWin);
-    const end = Math.min(n, i + halfWin + 1);
-    const count = end - start;
-
-    let sumR = 0, sumG = 0, sumB = 0;
-    for (let j = start; j < end; j++) {
-      sumR += r[j];
-      sumG += g[j];
-      sumB += b[j];
+  let first = -1;
+  for (let i = 0; i < result.length; i++) {
+    if (Number.isFinite(result[i])) {
+      first = i;
+      break;
     }
-    const muR = sumR / count || 1;
-    const muG = sumG / count || 1;
-    const muB = sumB / count || 1;
-
-    // Normalized color coordinates
-    const rn = r[i] / muR - 1;
-    const gn = g[i] / muG - 1;
-    const bn = b[i] / muB - 1;
-
-    // Plane orthogonal to skin:
-    // S_1 = Gn - Bn
-    // S_2 = Gn + Bn - 2*Rn
-    const s1 = gn - bn;
-    const s2 = gn + bn - 2 * rn;
-
-    sPos[i] = s1 + 1.2 * s2;
   }
 
-  const detrended = detrend(sPos, Math.round(sampleRate * 0.8));
-  const filtered = bandpassFilter(detrended, sampleRate, 0.7, 3.8);
-  const normalized = normalizeSignal(filtered);
+  if (first < 0) return result.map(() => 0);
 
-  const spectrum = computeFFT(normalized, sampleRate);
-  const { bpm, snrDb, peaks } = estimateHeartRate(normalized, sampleRate, spectrum);
-  const effectiveSnr = Math.min(25, snrDb + 1.8);
- const confidence = Math.min(0.99, Math.max(0.05, 0.3 + effectiveSnr / 18));
+  for (let i = 0; i < first; i++) result[i] = result[first];
 
-  const peakConsistency = computePeakConsistency(peaks, sampleRate);
-  const waveformQuality = computeWaveformQuality(normalized, effectiveSnr);
-  const windows = computeSlidingWindowRPPG(normalized, sampleRate, 10, 5);
-  const temporal = computeTemporalStability(windows);
+  for (let i = first + 1; i < result.length; i++) {
+    if (!Number.isFinite(result[i])) {
+      result[i] = result[i - 1];
+    }
+  }
+
+  return result;
+}
+
+/*
+ * Spectral quality calculation.
+ *
+ * This is a true ratio calculated from the measured spectrum. It is not
+ * artificially increased for display.
+ */
+function spectralQuality(
+  spectrum: { freq: number; power: number }[],
+  selectedHz: number,
+): { snrDb: number; peakPower: number; bandwidthPower: number } {
+  const band = spectrum.filter(
+    (bin) =>
+      bin.freq >= MIN_HZ && bin.freq <= MAX_HZ && Number.isFinite(bin.power),
+  );
+
+  if (!band.length) {
+    return { snrDb: -20, peakPower: 0, bandwidthPower: 0 };
+  }
+
+  const peakPower = band.reduce((max, bin) => Math.max(max, bin.power), 0);
+
+  const signalPower = band
+    .filter((bin) => Math.abs(bin.freq - selectedHz) <= 0.12)
+    .reduce((sum, bin) => sum + bin.power, 0);
+
+  const totalPower = band.reduce((sum, bin) => sum + bin.power, 0);
+  const noisePower = Math.max(1e-12, totalPower - signalPower);
+  const snrDb = 10 * Math.log10(Math.max(1e-12, signalPower / noisePower));
 
   return {
-    bpm,
-    snrDb: parseFloat(effectiveSnr.toFixed(1)),
-    confidence: parseFloat(confidence.toFixed(2)),
-    waveform: normalized,
+    snrDb: clamp(snrDb, -30, 30),
+    peakPower,
+    bandwidthPower: totalPower,
+  };
+}
+
+/*
+ * Estimate a candidate frequency from a spectrum without assuming that the
+ * largest bin is always the heart rate.
+ *
+ * The strongest spectral peak is compared with nearby sub-harmonic evidence.
+ * If a strong peak occurs near 2x another plausible peak, the lower frequency
+ * is treated as the fundamental candidate.
+ */
+function estimateSpectralCandidate(
+  spectrum: { freq: number; power: number }[],
+): { hz: number; snrDb: number } {
+  const bins = spectrum
+    .filter(
+      (b) =>
+        b.freq >= MIN_HZ &&
+        b.freq <= MAX_HZ &&
+        Number.isFinite(b.power) &&
+        b.power >= 0,
+    )
+    .sort((a, b) => b.power - a.power);
+
+  if (!bins.length) return { hz: 0, snrDb: -20 };
+
+  const strongest = bins[0];
+
+  /*
+   * Search for a local maximum around half of the strongest peak.
+   * A tolerance based on the FFT bin spacing is preferable to a fixed exact
+   * equality because discrete FFT bins rarely land exactly on f/2.
+   */
+  const sortedByFreq = [...bins].sort((a, b) => a.freq - b.freq);
+  const binSpacing =
+    sortedByFreq.length > 1
+      ? Math.max(
+          0.01,
+          median(
+            sortedByFreq
+              .slice(1)
+              .map((b, i) => b.freq - sortedByFreq[i].freq)
+              .filter((v) => v > 0),
+          ),
+        )
+      : 0.05;
+
+  const harmonicTolerance = Math.max(0.06, binSpacing * 1.75);
+  const half = strongest.freq / 2;
+
+  const halfCandidates = bins.filter(
+    (b) => Math.abs(b.freq - half) <= harmonicTolerance,
+  );
+
+  if (halfCandidates.length) {
+    const halfCandidate = halfCandidates.reduce(
+      (best, candidate) => (candidate.power > best.power ? candidate : best),
+      halfCandidates[0],
+    );
+
+    /*
+     * The sub-harmonic must have meaningful energy. We deliberately do not
+     * force a harmonic correction when the evidence is weak.
+     */
+    if (halfCandidate.power >= strongest.power * 0.22) {
+      const quality = spectralQuality(spectrum, halfCandidate.freq);
+      return {
+        hz: halfCandidate.freq,
+        snrDb: quality.snrDb,
+      };
+    }
+  }
+
+  const quality = spectralQuality(spectrum, strongest.freq);
+
+  return {
+    hz: strongest.freq,
+    snrDb: quality.snrDb,
+  };
+}
+
+/*
+ * Common post-processing for an individual method.
+ */
+function finalizeMethod(
+  waveform: number[],
+  sampleRate: number,
+  description: string,
+): MethodResult {
+  if (waveform.length < Math.max(30, Math.round(sampleRate * 4))) {
+    return emptyMethodResult(description);
+  }
+
+  const clean = safeNormalize(sanitizeSignal(waveform));
+
+  const spectrum = computeFFT(clean, sampleRate);
+
+  const spectralCandidate = estimateSpectralCandidate(spectrum);
+
+  /*
+   * Use the shared estimator as a second independent time-domain check.
+   * The shared estimator returns zero when it cannot form a valid result.
+   */
+  const estimated = estimateHeartRate(clean, sampleRate, spectrum);
+
+  let bpm = estimated.bpm;
+
+  /*
+   * If the shared estimator rejects the waveform but the spectrum has a
+   * valid candidate, retain the spectral candidate only when its measured
+   * spectral SNR is positive. This prevents a noisy spectrum from generating
+   * an arbitrary BPM.
+   */
+  if (bpm === 0 && spectralCandidate.hz > 0 && spectralCandidate.snrDb > 0) {
+    bpm = Math.round(spectralCandidate.hz * 60);
+  }
+
+  const snrDb = Number.isFinite(estimated.snrDb)
+    ? estimated.snrDb
+    : spectralCandidate.snrDb;
+
+  const peaks = estimated.peaks;
+
+  const peakConsistency = computePeakConsistency(peaks, sampleRate);
+
+  const waveformQuality = computeWaveformQuality(clean, snrDb);
+
+  const windows = computeSlidingWindowRPPG(clean, sampleRate, 10, 5);
+
+  const temporal = computeTemporalStability(windows);
+
+  /*
+   * Confidence is evidence-based:
+   * - measured SNR
+   * - peak consistency
+   * - temporal stability
+   *
+   * It is intentionally capped below "certain".
+   */
+  const snrEvidence = clamp((snrDb + 3) / 12, 0, 1);
+  const consistencyEvidence = peakConsistency / 100;
+  const temporalEvidence = temporal.score / 100;
+
+  const confidenceValue =
+    0.45 * snrEvidence + 0.25 * consistencyEvidence + 0.3 * temporalEvidence;
+
+  const confidence = clamp(confidenceValue, 0.05, 0.95);
+
+  return {
+    bpm:
+      Number.isFinite(bpm) && bpm >= MIN_BPM && bpm <= MAX_BPM
+        ? Math.round(bpm)
+        : 0,
+    snrDb: Number(snrDb.toFixed(1)),
+    confidence: Number(confidence.toFixed(2)),
+    waveform: clean,
     peaks,
     detectedPulsePeaks: peaks.length,
     peakConsistency,
     waveformQuality,
     temporalStability: temporal.score,
     spectrum,
-    description: 'Plane-Orthogonal-to-Skin spatial projection with motion compensation',
+    description,
   };
 }
 
-/**
- * 4. Multi-ROI Weighted Fusion Method
- * A local, hand-written weighted combination of forehead + cheek ROI signals.
- * NOTE: This is NOT the VitalLens API/model. It does not call any external
- * service and involves no neural network — it's a fixed linear projection,
- * in the same family as the CHROM/POS methods above. Naming it "VitalLens"
- * previously was misleading; renamed here to describe what it actually does.
+/* -------------------------------------------------------------------------- */
+/* 1. G-Channel                                                               */
+/* -------------------------------------------------------------------------- */
+
+export function processGMethod(
+  samples: RGBSample[],
+  sampleRate: number,
+): MethodResult {
+  if (samples.length < Math.max(30, sampleRate * 4)) {
+    return emptyMethodResult(
+      "Insufficient samples for G-channel rPPG analysis",
+    );
+  }
+
+  const actualRate = effectiveSampleRate(samples, sampleRate);
+
+  const gRaw = sanitizeSignal(samples.map((s) => s.g));
+
+  /*
+   * Green-channel rPPG is simple and useful as a baseline. We remove slow
+   * illumination drift and retain the cardiac band.
+   */
+  const detrended = detrend(gRaw, Math.max(5, Math.round(actualRate * 0.8)));
+
+  const filtered = bandpassFilter(
+    detrended,
+    actualRate,
+    CARDIAC_LOW,
+    CARDIAC_HIGH,
+  );
+
+  /*
+   * The sign is irrelevant for frequency estimation. Keeping the natural
+   * signal orientation avoids introducing an unnecessary transformation.
+   */
+  return finalizeMethod(
+    filtered,
+    actualRate,
+    "Green-channel pulse extraction with temporal detrending and cardiac-band filtering",
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* 2. CHROM                                                                    */
+/* -------------------------------------------------------------------------- */
+
+export function processChromMethod(
+  samples: RGBSample[],
+  sampleRate: number,
+): MethodResult {
+  const n = samples.length;
+
+  if (n < Math.max(30, sampleRate * 4)) {
+    return emptyMethodResult(
+      "Insufficient samples for windowed CHROM analysis",
+    );
+  }
+
+  const actualRate = effectiveSampleRate(samples, sampleRate);
+
+  const r = sanitizeSignal(samples.map((s) => s.r));
+  const g = sanitizeSignal(samples.map((s) => s.g));
+  const b = sanitizeSignal(samples.map((s) => s.b));
+
+  /*
+   * CHROM is fundamentally a local/windowed method.
+   *
+   * We use 1.6-second windows with 50% overlap. RGB normalization and alpha
+   * calculation are performed independently in each window.
+   */
+  const windowSize = Math.max(32, Math.round(actualRate * 1.6));
+
+  const stepSize = Math.max(1, Math.round(windowSize / 2));
+
+  const chromSignal = new Array<number>(n).fill(0);
+  const contributionCount = new Array<number>(n).fill(0);
+
+  for (let start = 0; start + windowSize <= n; start += stepSize) {
+    const end = start + windowSize;
+
+    const meanR = mean(r.slice(start, end));
+    const meanG = mean(g.slice(start, end));
+    const meanB = mean(b.slice(start, end));
+
+    if (
+      meanR <= 0 ||
+      meanG <= 0 ||
+      meanB <= 0 ||
+      !Number.isFinite(meanR) ||
+      !Number.isFinite(meanG) ||
+      !Number.isFinite(meanB)
+    ) {
+      continue;
+    }
+
+    const x = new Array<number>(windowSize);
+    const y = new Array<number>(windowSize);
+
+    for (let j = 0; j < windowSize; j++) {
+      const i = start + j;
+
+      const rn = r[i] / meanR;
+      const gn = g[i] / meanG;
+      const bn = b[i] / meanB;
+
+      /*
+       * CHROM chrominance projections.
+       */
+      x[j] = 3 * rn - 2 * gn;
+      y[j] = 1.5 * rn + gn - 1.5 * bn;
+    }
+
+    const meanX = mean(x);
+    const meanY = mean(y);
+
+    const stdX = standardDeviation(x);
+    const stdY = standardDeviation(y);
+
+    if (!Number.isFinite(stdX) || !Number.isFinite(stdY) || stdY < 1e-10) {
+      continue;
+    }
+
+    const alpha = stdX / stdY;
+
+    for (let j = 0; j < windowSize; j++) {
+      const i = start + j;
+
+      const pulse = x[j] - meanX + alpha * (y[j] - meanY);
+
+      chromSignal[i] += pulse;
+      contributionCount[i] += 1;
+    }
+  }
+
+  /*
+   * Normalize overlap-add contributions.
+   */
+  for (let i = 0; i < n; i++) {
+    if (contributionCount[i] > 0) {
+      chromSignal[i] /= contributionCount[i];
+    }
+  }
+
+  /*
+   * Boundary samples have fewer/no contributions. Interpolate from the
+   * nearest valid value rather than injecting a synthetic cardiac waveform.
+   */
+  const firstValid = contributionCount.findIndex((v) => v > 0);
+  let lastValid = -1;
+
+  for (let i = n - 1; i >= 0; i--) {
+    if (contributionCount[i] > 0) {
+      lastValid = i;
+      break;
+    }
+  }
+
+  if (firstValid < 0 || lastValid < 0) {
+    return emptyMethodResult(
+      "CHROM could not construct a valid windowed pulse signal",
+    );
+  }
+
+  for (let i = 0; i < firstValid; i++) {
+    chromSignal[i] = chromSignal[firstValid];
+  }
+
+  for (let i = lastValid + 1; i < n; i++) {
+    chromSignal[i] = chromSignal[lastValid];
+  }
+
+  const detrended = detrend(
+    chromSignal,
+    Math.max(5, Math.round(actualRate * 0.8)),
+  );
+
+  const filtered = bandpassFilter(
+    detrended,
+    actualRate,
+    CARDIAC_LOW,
+    CARDIAC_HIGH,
+  );
+
+  return finalizeMethod(
+    filtered,
+    actualRate,
+    "Windowed CHROM chrominance projection with local RGB normalization",
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* 3. POS                                                                      */
+/* -------------------------------------------------------------------------- */
+
+export function processPosMethod(
+  samples: RGBSample[],
+  sampleRate: number,
+): MethodResult {
+  const n = samples.length;
+
+  if (n < Math.max(30, sampleRate * 4)) {
+    return emptyMethodResult("Insufficient samples for POS rPPG analysis");
+  }
+
+  const actualRate = effectiveSampleRate(samples, sampleRate);
+
+  const r = sanitizeSignal(samples.map((s) => s.r));
+  const g = sanitizeSignal(samples.map((s) => s.g));
+  const b = sanitizeSignal(samples.map((s) => s.b));
+
+  /*
+   * Standard POS processing is performed over temporal windows. Each window
+   * normalizes RGB relative to its local mean and projects onto the
+   * plane orthogonal to the estimated skin-tone direction.
+   */
+  const windowSize = Math.max(32, Math.round(actualRate * 1.6));
+
+  const stepSize = Math.max(1, Math.round(windowSize / 2));
+
+  const posSignal = new Array<number>(n).fill(0);
+  const contributionCount = new Array<number>(n).fill(0);
+
+  for (let start = 0; start + windowSize <= n; start += stepSize) {
+    const end = start + windowSize;
+
+    const meanR = mean(r.slice(start, end));
+    const meanG = mean(g.slice(start, end));
+    const meanB = mean(b.slice(start, end));
+
+    if (meanR <= 0 || meanG <= 0 || meanB <= 0) {
+      continue;
+    }
+
+    const xs1 = new Array<number>(windowSize);
+    const xs2 = new Array<number>(windowSize);
+
+    for (let j = 0; j < windowSize; j++) {
+      const i = start + j;
+
+      const rn = r[i] / meanR;
+      const gn = g[i] / meanG;
+      const bn = b[i] / meanB;
+
+      /*
+       * POS projection matrix:
+       *
+       * S1 = G - B
+       * S2 = G + B - 2R
+       */
+      xs1[j] = gn - bn;
+      xs2[j] = gn + bn - 2 * rn;
+    }
+
+    const std1 = standardDeviation(xs1);
+    const std2 = standardDeviation(xs2);
+
+    if (!Number.isFinite(std1) || !Number.isFinite(std2) || std2 < 1e-10) {
+      continue;
+    }
+
+    /*
+     * POS combines the two projected components using the ratio of their
+     * standard deviations. The combination is calculated independently per
+     * window.
+     */
+    const alpha = std1 / std2;
+
+    for (let j = 0; j < windowSize; j++) {
+      const i = start + j;
+
+      const pulse = xs1[j] - mean(xs1) + alpha * (xs2[j] - mean(xs2));
+
+      posSignal[i] += pulse;
+      contributionCount[i] += 1;
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    if (contributionCount[i] > 0) {
+      posSignal[i] /= contributionCount[i];
+    }
+  }
+
+  const firstValid = contributionCount.findIndex((v) => v > 0);
+  let lastValid = -1;
+
+  for (let i = n - 1; i >= 0; i--) {
+    if (contributionCount[i] > 0) {
+      lastValid = i;
+      break;
+    }
+  }
+
+  if (firstValid < 0 || lastValid < 0) {
+    return emptyMethodResult(
+      "POS could not construct a valid windowed pulse signal",
+    );
+  }
+
+  for (let i = 0; i < firstValid; i++) {
+    posSignal[i] = posSignal[firstValid];
+  }
+
+  for (let i = lastValid + 1; i < n; i++) {
+    posSignal[i] = posSignal[lastValid];
+  }
+
+  const detrended = detrend(
+    posSignal,
+    Math.max(5, Math.round(actualRate * 0.8)),
+  );
+
+  const filtered = bandpassFilter(
+    detrended,
+    actualRate,
+    CARDIAC_LOW,
+    CARDIAC_HIGH,
+  );
+
+  return finalizeMethod(
+    filtered,
+    actualRate,
+    "Windowed POS plane-orthogonal-to-skin projection with adaptive component scaling",
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* 4. Multi-ROI Adaptive Fusion                                                */
+/* -------------------------------------------------------------------------- */
+
+type ROIName = "forehead" | "leftCheek" | "rightCheek";
+
+interface ROIResult {
+  name: ROIName;
+  waveform: number[];
+  quality: number;
+  bpm: number;
+  snrDb: number;
+  peakConsistency: number;
+  temporalStability: number;
+}
+
+function extractROIChannel(
+  samples: RGBSample[],
+  roi: ROIName,
+  channel: "r" | "g" | "b",
+): number[] {
+  return samples.map((sample) => sample[roi][channel]);
+}
+
+/*
+ * Measure a single ROI using green-channel pulse quality.
+ *
+ * Brightness is included only as a physical camera-quality gate; brightness
+ * alone never decides the ROI weight.
  */
+function analyzeROI(
+  samples: RGBSample[],
+  sampleRate: number,
+  roi: ROIName,
+): ROIResult {
+  const actualRate = effectiveSampleRate(samples, sampleRate);
+
+  const r = sanitizeSignal(extractROIChannel(samples, roi, "r"));
+  const g = sanitizeSignal(extractROIChannel(samples, roi, "g"));
+  const b = sanitizeSignal(extractROIChannel(samples, roi, "b"));
+
+  /*
+   * Use CHROM-like local color normalization for the ROI itself. This avoids
+   * making ROI selection dependent only on raw green brightness.
+   */
+  const roiSamples: RGBSample[] = samples.map((s, i) => ({
+    ...s,
+    r: r[i],
+    g: g[i],
+    b: b[i],
+  }));
+
+  const chrom = processChromMethod(roiSamples, actualRate);
+
+  const brightness = mean(
+    samples.map((s) => (s[roi].r + s[roi].g + s[roi].b) / 3),
+  );
+
+  const exposureQuality =
+    brightness < 25
+      ? clamp(brightness / 25, 0, 1)
+      : brightness > 245
+        ? clamp((255 - brightness) / 10, 0, 1)
+        : 1;
+
+  const snrQuality = clamp((chrom.snrDb + 3) / 12, 0, 1);
+
+  const consistencyQuality = chrom.peakConsistency / 100;
+
+  const temporalQuality = chrom.temporalStability / 100;
+
+  const quality =
+    100 *
+    (0.4 * snrQuality +
+      0.25 * consistencyQuality +
+      0.25 * temporalQuality +
+      0.1 * exposureQuality);
+
+  return {
+    name: roi,
+    waveform: chrom.waveform,
+    quality: Math.round(clamp(quality, 0, 100)),
+    bpm: chrom.bpm,
+    snrDb: chrom.snrDb,
+    peakConsistency: chrom.peakConsistency,
+    temporalStability: chrom.temporalStability,
+  };
+}
+
 export function processMultiROIFusionMethod(
   samples: RGBSample[],
   sampleRate: number,
   chromResult: MethodResult,
-  posResult: MethodResult
+  posResult: MethodResult,
 ): MethodResult {
+  /*
+   * These parameters are intentionally accepted because the public API
+   * already passes the CHROM/POS results. The adaptive ROI method does not
+   * blindly copy their BPM values.
+   */
+  void chromResult;
+  void posResult;
+
   const n = samples.length;
-  const weightedWaveform: number[] = new Array(n);
 
-  for (let i = 0; i < n; i++) {
-    const s = samples[i];
-    const fhG = s.forehead.g;
-    const lcG = s.leftCheek.g;
-    const rcG = s.rightCheek.g;
-
-    const spatialG = 0.5 * fhG + 0.25 * lcG + 0.25 * rcG;
-    const spatialR = 0.5 * s.forehead.r + 0.25 * s.leftCheek.r + 0.25 * s.rightCheek.r;
-    const spatialB = 0.5 * s.forehead.b + 0.25 * s.leftCheek.b + 0.25 * s.rightCheek.b;
-
-    // Fixed multi-ROI linear projection weights (not a trained/learned model)
-    const vPulse = 1.95 * spatialG - 0.95 * spatialR - 0.85 * spatialB;
-    weightedWaveform[i] = vPulse;
+  if (n < Math.max(30, sampleRate * 4)) {
+    return emptyMethodResult("Insufficient samples for Multi-ROI analysis");
   }
 
-  const detrended = detrend(weightedWaveform, Math.round(sampleRate * 0.8));
-  const filtered = bandpassFilter(detrended, sampleRate, 0.7, 3.8);
-  const normalized = normalizeSignal(filtered);
+  const actualRate = effectiveSampleRate(samples, sampleRate);
 
-  const spectrum = computeFFT(normalized, sampleRate);
-  const { bpm, snrDb, peaks } = estimateHeartRate(normalized, sampleRate, spectrum);
+  const roiResults = [
+    analyzeROI(samples, actualRate, "forehead"),
+    analyzeROI(samples, actualRate, "leftCheek"),
+    analyzeROI(samples, actualRate, "rightCheek"),
+  ];
 
-  const multiRoiBpm = bpm; // For now, just use the BPM from this method; could also compute a weighted consensus with chrom/pos if desired
-  const effectiveSnr = Math.min(26, snrDb + 2.2);
-  const confidence = Math.min(0.99, Math.max(0.05, 0.3 + effectiveSnr / 20));
+  /*
+   * Quality-weighted waveform fusion.
+   *
+   * No fixed 50/25/25 ROI weights are used. Every ROI gets its measured
+   * quality weight and is normalized before fusion so raw skin brightness
+   * cannot dominate the result.
+   */
+  const weights = roiResults.map((roi) => Math.max(0, roi.quality));
 
-  const peakConsistency = computePeakConsistency(peaks, sampleRate);
-  const waveformQuality = computeWaveformQuality(normalized, effectiveSnr);
-  const windows = computeSlidingWindowRPPG(
-    normalized,
-    sampleRate,
-    normalized.length / sampleRate >= 20 ? 10 : 8,
-    normalized.length / sampleRate >= 20 ? 5 : 3,
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+
+  if (totalWeight <= 0) {
+    return emptyMethodResult(
+      "No Multi-ROI region passed signal-quality checks",
+    );
+  }
+
+  const weightedWaveform = new Array<number>(n).fill(0);
+
+  for (let i = 0; i < n; i++) {
+    let numerator = 0;
+    let denominator = 0;
+
+    for (let r = 0; r < roiResults.length; r++) {
+      const roi = roiResults[r];
+
+      if (
+        roi.waveform.length === n &&
+        Number.isFinite(roi.waveform[i]) &&
+        weights[r] > 0
+      ) {
+        numerator += roi.waveform[i] * weights[r];
+        denominator += weights[r];
+      }
+    }
+
+    weightedWaveform[i] = denominator > 0 ? numerator / denominator : 0;
+  }
+
+  /*
+   * Final Multi-ROI cardiac filtering.
+   */
+  const detrended = detrend(
+    weightedWaveform,
+    Math.max(5, Math.round(actualRate * 0.8)),
   );
-  const temporal = computeTemporalStability(windows);
 
-  return {
-   bpm: multiRoiBpm,
-    snrDb: parseFloat(effectiveSnr.toFixed(1)),
-    confidence: parseFloat(confidence.toFixed(2)),
-    waveform: normalized,
-    peaks,
-    detectedPulsePeaks: peaks.length,
-    peakConsistency,
-    waveformQuality,
-    temporalStability: temporal.score,
-    spectrum,
-    description: 'Multi-ROI weighted RGB fusion (forehead + left/right cheek), local linear projection',
-  };
+  const filtered = bandpassFilter(
+    detrended,
+    actualRate,
+    CARDIAC_LOW,
+    CARDIAC_HIGH,
+  );
+
+  return finalizeMethod(
+    filtered,
+    actualRate,
+    "Adaptive Multi-ROI fusion using measured forehead and cheek pulse quality",
+  );
 }
 
-/**
- * Cross-Method Validation & Consensus Assessment (Improvement #6, #12, #13)
- */
+/* -------------------------------------------------------------------------- */
+/* Cross-method consensus                                                      */
+/* -------------------------------------------------------------------------- */
+
 export function evaluateMethodComparison(results: {
   g: MethodResult;
   chrom: MethodResult;
   pos: MethodResult;
   vitallens: MethodResult;
 }): MethodComparison {
-  const bpms = [
-    results.g.bpm,
-    results.chrom.bpm,
-    results.pos.bpm,
-    results.vitallens.bpm,
-  ];
-
-  // Basic statistics
-  const minBpm = Math.min(...bpms);
-  const maxBpm = Math.max(...bpms);
-  const algorithmRange = maxBpm - minBpm;
-
-  const mean =
-    bpms.reduce((sum, bpm) => sum + bpm, 0) / bpms.length;
-
-  const variance =
-    bpms.reduce(
-      (sum, bpm) => sum + Math.pow(bpm - mean, 2),
-      0
-    ) / bpms.length;
-
-  const stdDev = parseFloat(
-    Math.sqrt(variance).toFixed(1)
-  );
-
-  // ------------------------------------------------------------
-  // Robust central estimate
-  //
-  // Median is deliberately used as the starting point instead
-  // of blindly averaging all algorithms. This prevents one
-  // extreme outlier from pulling the final estimate too far.
-  // ------------------------------------------------------------
-  const sortedBpms = [...bpms].sort((a, b) => a - b);
-
-  const medianBpm =
-    sortedBpms.length % 2 === 0
-      ? (sortedBpms[sortedBpms.length / 2 - 1] +
-          sortedBpms[sortedBpms.length / 2]) /
-        2
-      : sortedBpms[Math.floor(sortedBpms.length / 2)];
-
-  // ------------------------------------------------------------
-  // Agreement classification
-  // ------------------------------------------------------------
-  let agreementStatus: MethodComparison['agreementStatus'] =
-    'HIGH';
-
-  if (algorithmRange > 20 || stdDev > 8) {
-    agreementStatus = 'LOW';
-  } else if (algorithmRange > 8 || stdDev > 4) {
-    agreementStatus = 'MODERATE';
-  }
-
-  // ------------------------------------------------------------
-  // Confidence + SNR based reliability
-  //
-  // Negative SNR should not receive a strong weight.
-  // ------------------------------------------------------------
-  const getBaseWeight = (result: MethodResult) => {
-    const snrQuality = Math.max(
-      0.1,
-      Math.min(2.5, (result.snrDb + 5) / 6)
-    );
-
-    return Math.max(
-      0.1,
-      result.confidence * snrQuality
-    );
-  };
-
   const methodResults = [
     results.g,
     results.chrom,
@@ -353,51 +907,143 @@ export function evaluateMethodComparison(results: {
     results.vitallens,
   ];
 
-  // ------------------------------------------------------------
-  // Outlier-resistant weighting
-  //
-  // Methods far away from the median receive less influence.
-  // This is especially important when one algorithm produces
-  // an implausibly different BPM.
-  // ------------------------------------------------------------
-  const weights = methodResults.map((result) => {
-    const baseWeight = getBaseWeight(result);
+  const validResults = methodResults.filter(
+    (result) =>
+      Number.isFinite(result.bpm) &&
+      result.bpm >= MIN_BPM &&
+      result.bpm <= MAX_BPM,
+  );
 
-    const distanceFromMedian = Math.abs(
-      result.bpm - medianBpm
-    );
+  const bpms = validResults.map((r) => r.bpm);
 
-    let agreementFactor = 1;
+  /*
+   * No valid method means no physiological estimate.
+   */
+  if (!bpms.length) {
+    return {
+      g: 0,
+      chrom: 0,
+      pos: 0,
+      vitalLens: 0,
+      consensusBpm: 0,
+      stdDev: 0,
+      algorithmRange: 0,
+      minBpm: 0,
+      maxBpm: 0,
+      agreementStatus: "LOW",
+    };
+  }
 
-    if (distanceFromMedian > 30) {
-      agreementFactor = 0.15;
-    } else if (distanceFromMedian > 20) {
-      agreementFactor = 0.35;
-    } else if (distanceFromMedian > 12) {
-      agreementFactor = 0.60;
-    } else if (distanceFromMedian > 6) {
-      agreementFactor = 0.80;
+  const minBpm = Math.min(...bpms);
+  const maxBpm = Math.max(...bpms);
+  const algorithmRange = maxBpm - minBpm;
+  const stdDev = Number(standardDeviation(bpms).toFixed(1));
+
+  /*
+   * Build a weighted consensus around the densest cluster rather than using
+   * the median as a substitute for evidence.
+   *
+   * A method gets:
+   *   - its measured confidence
+   *   - measured SNR quality
+   *   - peak consistency
+   *   - temporal stability
+   *   - proximity to the strongest cluster
+   */
+  const clusterRadius = 8;
+
+  let bestClusterWeight = -Infinity;
+  let bestClusterCenter = median(bpms);
+
+  for (const candidate of bpms) {
+    let clusterWeight = 0;
+
+    for (const result of validResults) {
+      const distance = Math.abs(result.bpm - candidate);
+
+      if (distance <= clusterRadius) {
+        const snrQuality = clamp((result.snrDb + 3) / 12, 0, 1);
+
+        const quality =
+          0.4 * result.confidence +
+          0.25 * snrQuality +
+          0.2 * (result.peakConsistency / 100) +
+          0.15 * (result.temporalStability / 100);
+
+        clusterWeight += Math.max(0.01, quality);
+      }
     }
 
-    return baseWeight * agreementFactor;
-  });
+    if (clusterWeight > bestClusterWeight) {
+      bestClusterWeight = clusterWeight;
+      bestClusterCenter = candidate;
+    }
+  }
 
-  const sumWeights =
-    weights.reduce((sum, weight) => sum + weight, 0) || 1;
+  const clusterMembers = validResults.filter(
+    (result) => Math.abs(result.bpm - bestClusterCenter) <= clusterRadius,
+  );
+
+  let weightedNumerator = 0;
+  let weightedDenominator = 0;
+
+  for (const result of clusterMembers) {
+    const snrQuality = clamp((result.snrDb + 3) / 12, 0, 1);
+
+    const baseWeight =
+      0.4 * result.confidence +
+      0.25 * snrQuality +
+      0.2 * (result.peakConsistency / 100) +
+      0.15 * (result.temporalStability / 100);
+
+    const distancePenalty =
+      1 / (1 + Math.abs(result.bpm - bestClusterCenter) / 4);
+
+    const weight = Math.max(0.01, baseWeight) * distancePenalty;
+
+    weightedNumerator += result.bpm * weight;
+
+    weightedDenominator += weight;
+  }
 
   const weightedBpm =
-    methodResults.reduce(
-      (sum, result, index) =>
-        sum + result.bpm * weights[index],
-      0
-    ) / sumWeights;
+    weightedDenominator > 0
+      ? weightedNumerator / weightedDenominator
+      : bestClusterCenter;
 
-  // When disagreement is severe, prefer the robust median
-  // rather than allowing a weighted average to hide the problem.
+  /*
+   * Require at least two agreeing valid methods before declaring a strong
+   * cross-method consensus. A single method can still provide a provisional
+   * estimate, but it must not be represented as high agreement.
+   */
+  const agreementStatus: MethodComparison["agreementStatus"] =
+    bpms.length >= 3 &&
+    clusterMembers.length >= 3 &&
+    algorithmRange <= 12 &&
+    stdDev <= 4
+      ? "HIGH"
+      : clusterMembers.length >= 2 && algorithmRange <= 20 && stdDev <= 8
+        ? "MODERATE"
+        : "LOW";
+
+  /*
+   * Severe disagreement is not resolved by taking the median.
+   * In that case consensusBpm is zero, forcing the validation layer to reject
+   * the measurement rather than hide the disagreement.
+   */
+  const reliableCluster =
+    clusterMembers.length >= 2 &&
+    (clusterMembers.length >= 3
+      ? algorithmRange <= 20 && stdDev <= 8
+      : algorithmRange <= 12);
+
   const consensusBpm =
-    algorithmRange > 25 || stdDev > 10
-      ? Math.round(medianBpm)
-      : Math.round(weightedBpm);
+    reliableCluster &&
+    Number.isFinite(weightedBpm) &&
+    weightedBpm >= MIN_BPM &&
+    weightedBpm <= MAX_BPM
+      ? Math.round(weightedBpm)
+      : 0;
 
   return {
     g: results.g.bpm,
@@ -413,51 +1059,52 @@ export function evaluateMethodComparison(results: {
   };
 }
 
-/**
- * Multi-ROI Quality Assessment & Dynamic Selection (Improvement #2, #7, #8)
- */
+/* -------------------------------------------------------------------------- */
+/* Multi-ROI quality                                                           */
+/* -------------------------------------------------------------------------- */
+
 export function evaluateROIQuality(samples: RGBSample[]): ROIQualityBreakdown {
   const n = samples.length;
-  if (n === 0) {
+
+  if (!n) {
     return {
-      forehead: 85,
-      leftCheek: 80,
-      rightCheek: 82,
-      overall: 82,
-      selectedROIs: ['Forehead', 'Left Cheek', 'Right Cheek'],
+      forehead: 0,
+      leftCheek: 0,
+      rightCheek: 0,
+      overall: 0,
+      selectedROIs: [],
     };
   }
 
-  // Measure variance and brightness per ROI
-  let fhBright = 0, lcBright = 0, rcBright = 0;
-  for (let i = 0; i < n; i++) {
-    const s = samples[i];
-    fhBright += (s.forehead.r + s.forehead.g + s.forehead.b) / 3;
-    lcBright += (s.leftCheek.r + s.leftCheek.g + s.leftCheek.b) / 3;
-    rcBright += (s.rightCheek.r + s.rightCheek.g + s.rightCheek.b) / 3;
-  }
-  const avgFh = fhBright / n;
-  const avgLc = lcBright / n;
-  const avgRc = rcBright / n;
+  const sampleRate = effectiveSampleRate(samples, 30);
 
-  // Quality penalty for extreme underexposure or glare
-  const scoreROI = (bright: number) => {
-    if (bright < 35) return Math.max(20, Math.round((bright / 35) * 60));
-    if (bright > 230) return Math.max(30, Math.round(100 - (bright - 230) * 2));
-    return Math.min(98, Math.round(75 + (bright > 60 && bright < 200 ? 18 : 5)));
-  };
+  const roiResults = [
+    analyzeROI(samples, sampleRate, "forehead"),
+    analyzeROI(samples, sampleRate, "leftCheek"),
+    analyzeROI(samples, sampleRate, "rightCheek"),
+  ];
 
-  const forehead = scoreROI(avgFh);
-  const leftCheek = scoreROI(avgLc);
-  const rightCheek = scoreROI(avgRc);
+  const forehead = roiResults[0].quality;
+  const leftCheek = roiResults[1].quality;
+  const rightCheek = roiResults[2].quality;
 
+  /*
+   * Require a real quality score before selecting an ROI. There is no
+   * unconditional "forehead fallback" with a fabricated quality value.
+   */
   const selectedROIs: string[] = [];
-  if (forehead >= 50) selectedROIs.push('Forehead');
-  if (leftCheek >= 50) selectedROIs.push('Left Cheek');
-  if (rightCheek >= 50) selectedROIs.push('Right Cheek');
-  if (selectedROIs.length === 0) selectedROIs.push('Forehead'); // Fallback
 
-  const overall = Math.round(0.44 * forehead + 0.28 * leftCheek + 0.28 * rightCheek);
+  if (forehead >= 50) selectedROIs.push("Forehead");
+  if (leftCheek >= 50) selectedROIs.push("Left Cheek");
+  if (rightCheek >= 50) selectedROIs.push("Right Cheek");
+
+  /*
+   * Overall quality is weighted toward forehead because it generally offers
+   * a useful vascular region, but its score is still measured from the signal.
+   */
+  const overall = Math.round(
+    0.44 * forehead + 0.28 * leftCheek + 0.28 * rightCheek,
+  );
 
   return {
     forehead,
@@ -468,68 +1115,78 @@ export function evaluateROIQuality(samples: RGBSample[]): ROIQualityBreakdown {
   };
 }
 
-/**
- * Generate Quality Timeline Across Recording (Improvement #18 & #28)
- */
+/* -------------------------------------------------------------------------- */
+/* Quality timeline                                                            */
+/* -------------------------------------------------------------------------- */
+
 export function generateQualityTimeline(
   samples: RGBSample[],
-  sampleRate: number = 30,
-  intervalSec: number = 5
+  sampleRate = 30,
+  intervalSec = 5,
 ): QualityTimelineInterval[] {
-  const intervalSamples = Math.round(intervalSec * sampleRate);
-  const total = samples.length;
+  if (!samples.length) return [];
+
+  const actualRate = effectiveSampleRate(samples, sampleRate);
+
+  const intervalSamples = Math.max(1, Math.round(intervalSec * actualRate));
+
   const timeline: QualityTimelineInterval[] = [];
 
-  let idx = 1;
-  for (let start = 0; start < total; start += intervalSamples) {
-    const end = Math.min(total, start + intervalSamples);
+  let index = 1;
+
+  for (let start = 0; start < samples.length; start += intervalSamples) {
+    const end = Math.min(samples.length, start + intervalSamples);
+
     const chunk = samples.slice(start, end);
-    const chunkCount = chunk.length;
 
-    let totalMotion = 0;
-    let totalIllum = 0;
-    let totalFace = 0;
+    if (!chunk.length) continue;
 
-    for (let i = 0; i < chunkCount; i++) {
-      totalMotion += chunk[i].motionVariance;
-      totalIllum += (chunk[i].r + chunk[i].g + chunk[i].b) / 3;
-      totalFace += chunk[i].faceConfidence;
-    }
+    const avgMotion = mean(chunk.map((s) => s.motionVariance));
 
-    const avgMotion = totalMotion / chunkCount;
-    const avgIllum = totalIllum / chunkCount;
-    const avgFace = totalFace / chunkCount;
+    const avgIllumination = mean(chunk.map((s) => (s.r + s.g + s.b) / 3));
 
-    const motionScore = Math.max(0, Math.min(100, Math.round(100 - avgMotion * 80)));
+    const avgFaceConfidence = mean(chunk.map((s) => s.faceConfidence));
+
+    /*
+     * These are physical acquisition quality indicators, not BPM accuracy.
+     */
+    const motionScore = clamp(100 - avgMotion * 80, 0, 100);
+
     const lightingScore =
-      avgIllum < 40
-        ? Math.round((avgIllum / 40) * 60)
-        : avgIllum > 230
-        ? Math.round(100 - (avgIllum - 230) * 2)
-        : 92;
-    const faceScore = Math.round(avgFace * 100);
+      avgIllumination < 40
+        ? clamp((avgIllumination / 40) * 60, 0, 60)
+        : avgIllumination > 230
+          ? clamp(100 - (avgIllumination - 230) * 2, 0, 100)
+          : 92;
 
-    const qualityScore = Math.round(0.4 * motionScore + 0.3 * lightingScore + 0.3 * faceScore);
+    const faceScore = clamp(avgFaceConfidence * 100, 0, 100);
 
-    let status: 'GOOD' | 'FAIR' | 'POOR' = 'GOOD';
-    let note = 'Optimal optical tracking';
+    const qualityScore = Math.round(
+      0.4 * motionScore + 0.3 * lightingScore + 0.3 * faceScore,
+    );
+
+    let status: "GOOD" | "FAIR" | "POOR" = "GOOD";
+    let note = "Optimal optical tracking";
 
     if (qualityScore < 55 || motionScore < 50) {
-      status = 'POOR';
-      note = motionScore < 50 ? 'Excessive motion detected' : 'Low signal quality';
+      status = "POOR";
+      note =
+        motionScore < 50
+          ? "Excessive motion detected"
+          : "Low acquisition quality";
     } else if (qualityScore < 75) {
-      status = 'FAIR';
-      note = 'Moderate optical stability';
+      status = "FAIR";
+      note = "Moderate optical stability";
     }
 
     timeline.push({
-      intervalIndex: idx++,
-      startSec: parseFloat((start / sampleRate).toFixed(1)),
-      endSec: parseFloat((end / sampleRate).toFixed(1)),
+      intervalIndex: index++,
+      startSec: Number((start / actualRate).toFixed(1)),
+      endSec: Number((end / actualRate).toFixed(1)),
       status,
       qualityScore,
-      motionScore,
-      lightingScore,
+      motionScore: Math.round(motionScore),
+      lightingScore: Math.round(lightingScore),
       note,
     });
   }
@@ -537,9 +1194,10 @@ export function generateQualityTimeline(
   return timeline;
 }
 
-/**
- * Signal Quality Engine Assessment & Multi-Factor Confidence Fusion (Improvement #7 & #14)
- */
+/* -------------------------------------------------------------------------- */
+/* Signal quality / decision engine                                            */
+/* -------------------------------------------------------------------------- */
+
 export function evaluateSignalQuality(
   samples: RGBSample[],
   comparison: MethodComparison,
@@ -549,171 +1207,263 @@ export function evaluateSignalQuality(
     pos: MethodResult;
     vitallens: MethodResult;
   },
-  sampleRate: number = 30,
+  sampleRate = 30,
 ): SignalQuality {
-  const n = samples.length;
   const warnings: string[] = [];
   const retryReasons: string[] = [];
 
-  // 1. Face Tracking Quality
-  const avgFaceConf = samples.reduce((a, s) => a + s.faceConfidence, 0) / n;
-  const faceScore = Math.round(avgFaceConf * 100);
+  if (!samples.length) {
+    return {
+      overall: 0,
+      confidenceTier: "LOW",
+      decision: "RETRY",
+      decisionReason: "No camera samples were available.",
+      faceConfidence: 0,
+      roiStability: 0,
+      roiQuality: {
+        forehead: 0,
+        leftCheek: 0,
+        rightCheek: 0,
+        overall: 0,
+        selectedROIs: [],
+      },
+      illumination: 0,
+      lightingQuality: 0,
+      motionStability: 0,
+      motionQuality: 0,
+      waveformSNR: -20,
+      snrScore: 0,
+      temporalStability: 0,
+      temporalStabilityStatus: "UNSTABLE",
+      algorithmAgreement: 0,
+      algorithmRange: 0,
+      isReliable: false,
+      warnings: ["No camera samples were available."],
+      retryReasons: ["Insufficient signal data"],
+      qualityTimeline: [],
+      windowAnalysis: [],
+    };
+  }
+
+  const actualRate = effectiveSampleRate(samples, sampleRate);
+
+  /* 1. Face tracking */
+  const avgFaceConf = mean(samples.map((s) => s.faceConfidence));
+
+  const faceScore = Math.round(clamp(avgFaceConf * 100, 0, 100));
+
   if (faceScore < 70) {
     warnings.push(
       "Face tracking was intermittent. Position yourself centrally in frame.",
     );
   }
 
-  // 2. Motion Quality
-  const avgMotion = samples.reduce((a, s) => a + s.motionVariance, 0) / n;
-  const motionScore = Math.max(
-    0,
-    Math.min(100, Math.round(100 - avgMotion * 80)),
-  );
+  if (faceScore < 55) {
+    retryReasons.push("Unstable face tracking");
+  }
+
+  /* 2. Motion */
+  const avgMotion = mean(samples.map((s) => s.motionVariance));
+
+  const motionScore = Math.round(clamp(100 - avgMotion * 80, 0, 100));
+
   if (motionScore < 58) {
     warnings.push("Significant head movement detected during scanning.");
     retryReasons.push("Excessive movement during scan");
   }
 
-  // 3. Lighting Quality
-  const avgBrightness =
-    samples.reduce((a, s) => a + (s.r + s.g + s.b) / 3, 0) / n;
+  /* 3. Lighting */
+  const avgBrightness = mean(samples.map((s) => (s.r + s.g + s.b) / 3));
+
   let illuminationScore = 92;
+
   if (avgBrightness < 45) {
-    illuminationScore = Math.round((avgBrightness / 45) * 60);
+    illuminationScore = Math.round(clamp((avgBrightness / 45) * 60, 0, 60));
+
     warnings.push("Low ambient lighting. Please face a diffuse light source.");
-    if (avgBrightness < 30) retryReasons.push("Insufficient ambient light");
+
+    if (avgBrightness < 30) {
+      retryReasons.push("Insufficient ambient light");
+    }
   } else if (avgBrightness > 225) {
-    illuminationScore = Math.max(
-      40,
-      Math.round(100 - (avgBrightness - 225) * 2),
+    illuminationScore = Math.round(
+      clamp(100 - (avgBrightness - 225) * 2, 40, 100),
     );
+
     warnings.push("Facial glare / camera overexposure detected.");
+
+    if (avgBrightness > 245) {
+      retryReasons.push("Severe overexposure");
+    }
   }
 
-  // 4. Waveform SNR Score
-  const avgSnrDb =
-    (results.chrom.snrDb + results.pos.snrDb + results.vitallens.snrDb) / 3;
-  const snrScore = Math.max(0, Math.min(100, Math.round(avgSnrDb * 4.5 + 35)));
-  if (avgSnrDb < 2.0) {
-    warnings.push("Extracted signal-to-noise ratio is weak.");
-    retryReasons.push("Weak optical pulse signal (SNR < 2.0 dB)");
+  /* 4. SNR */
+  const validSnrs = [
+    results.g.snrDb,
+    results.chrom.snrDb,
+    results.pos.snrDb,
+    results.vitallens.snrDb,
+  ].filter(Number.isFinite);
+
+  const avgSnrDb = validSnrs.length ? mean(validSnrs) : -20;
+
+  /*
+   * Negative SNR is genuinely poor. No offsets are added.
+   */
+  const snrScore = Math.round(clamp(((avgSnrDb + 3) / 12) * 100, 0, 100));
+
+  if (avgSnrDb < 2) {
+    warnings.push("Extracted pulse signal-to-noise ratio is weak.");
+    retryReasons.push("Weak optical pulse signal");
   }
 
-  // 5. Algorithm Agreement Score
-  //
-  // Agreement is treated as a major validation factor.
-  // A cloud result returning successfully does NOT mean that
-  // the overall physiological measurement is reliable.
+  /* 5. Algorithm agreement */
+  let methodAgreement = 0;
 
-  let methodAgreement = 95;
-
-  if (comparison.algorithmRange > 30 || comparison.stdDev > 10) {
+  if (comparison.agreementStatus === "HIGH") {
+    methodAgreement = 90;
+  } else if (comparison.agreementStatus === "MODERATE") {
+    methodAgreement = 65;
+  } else {
     methodAgreement = 20;
-
     warnings.push(
-      `Severe algorithm disagreement detected (Spread: ${comparison.algorithmRange} BPM).`,
+      `Severe cross-method disagreement detected (Spread: ${comparison.algorithmRange} BPM).`,
     );
-
     retryReasons.push("Severe cross-method disagreement");
-  } else if (comparison.algorithmRange > 20 || comparison.stdDev > 8) {
-    methodAgreement = 30;
-
-    warnings.push(
-      `High algorithm disagreement detected (Spread: ${comparison.algorithmRange} BPM).`,
-    );
-
-    retryReasons.push("High algorithm disagreement (Spread > 20 BPM)");
-  } else if (comparison.algorithmRange > 12 || comparison.stdDev > 6) {
-    methodAgreement = 45;
-
-    warnings.push(
-      `Algorithms produced divergent results (Spread: ${comparison.algorithmRange} BPM).`,
-    );
-
-    retryReasons.push("Algorithm disagreement (Spread > 12 BPM)");
-  } else if (comparison.algorithmRange > 6 || comparison.stdDev > 3.5) {
-    methodAgreement = 68;
-
-    warnings.push("Moderate algorithm variance between rPPG projections.");
   }
 
-  // 6. Multi-ROI Quality
+  /* 6. ROI quality */
   const roiQuality = evaluateROIQuality(samples);
+
   if (roiQuality.overall < 55) {
-    warnings.push(
-      "Suboptimal vascular ROI illumination on cheek/forehead zones.",
-    );
+    warnings.push("Suboptimal vascular ROI signal quality.");
+    retryReasons.push("Poor forehead/cheek optical signal");
   }
 
-  // 7. Temporal Sliding Window Analysis & Stability
-  const primaryWaveform =
-    results.pos.snrDb >= results.chrom.snrDb
-      ? results.pos.waveform
-      : results.chrom.waveform;
-  const windowAnalysis = computeSlidingWindowRPPG(
-    primaryWaveform,
-    sampleRate,
-    10,
-    5,
-  );
+  /* 7. Temporal analysis */
+  const primaryCandidates = [
+    results.g,
+    results.chrom,
+    results.pos,
+    results.vitallens,
+  ]
+    .filter((r) => r.waveform.length > 0 && Number.isFinite(r.snrDb))
+    .sort((a, b) => b.snrDb - a.snrDb);
+
+  const primaryWaveform = primaryCandidates[0]?.waveform ?? [];
+
+  const windowAnalysis = primaryWaveform.length
+    ? computeSlidingWindowRPPG(primaryWaveform, actualRate, 10, 5)
+    : [];
+
   const temporal = computeTemporalStability(windowAnalysis);
+
   if (temporal.status === "UNSTABLE") {
     warnings.push(
-      "Temporal instability: Heart rate estimates fluctuated across recording windows.",
+      "Temporal instability: heart-rate estimates fluctuated across recording windows.",
     );
-    retryReasons.push("Temporal waveform instability across windows");
+    retryReasons.push("Temporal waveform instability");
   }
 
-  // 8. Multi-Factor Confidence Fusion Engine (Improvement #7 & #14)
-  // Confidence = Signal Quality + SNR Quality + Temporal Stability + ROI Quality + Algorithm Agreement + Motion Quality + Lighting Quality
+  /*
+   * 8. Final quality score.
+   *
+   * Algorithm agreement and temporal stability have significant weight,
+   * because a large spectral peak alone is not proof of a cardiac signal.
+   */
   const overall = Math.round(
-    0.2 * methodAgreement +
-      0.2 * temporal.score +
-      0.15 * snrScore +
-      0.15 * motionScore +
-      0.1 * illuminationScore +
-      0.1 * roiQuality.overall +
-      0.1 * faceScore,
+    clamp(
+      0.2 * methodAgreement +
+        0.2 * temporal.score +
+        0.15 * snrScore +
+        0.15 * motionScore +
+        0.1 * illuminationScore +
+        0.1 * roiQuality.overall +
+        0.1 * faceScore,
+      0,
+      100,
+    ),
   );
 
-  // Confidence Tier (Improvement #15)
+  /*
+   * Confidence tier.
+   *
+   * Strong agreement alone is insufficient. A measurement must also have
+   * adequate signal and temporal stability.
+   */
   let confidenceTier: ConfidenceTier = "HIGH";
+
   if (
     overall < 60 ||
-    comparison.algorithmRange > 20 ||
-    comparison.stdDev > 8 ||
-    temporal.status === "UNSTABLE"
+    comparison.agreementStatus === "LOW" ||
+    avgSnrDb < 0 ||
+    temporal.status === "UNSTABLE" ||
+    motionScore < 50 ||
+    faceScore < 55
   ) {
     confidenceTier = "LOW";
   } else if (
     overall < 76 ||
-    comparison.algorithmRange > 8 ||
-    comparison.stdDev > 4 ||
+    comparison.agreementStatus === "MODERATE" ||
+    avgSnrDb < 4 ||
     temporal.status === "MODERATE"
   ) {
     confidenceTier = "MEDIUM";
   }
 
-  // Accept vs Retry Decision Engine (Improvement #8, #9, #16, #17, #19)
-  let decision: DecisionOutcome = "ACCEPT";
-  let decisionReason =
-    "Strong multi-method agreement, stable waveform, and high SNR passed all quality thresholds.";
+  /*
+   * Acceptance gate.
+   *
+   * A BPM should only be accepted if:
+   *   - consensus exists
+   *   - at least two methods support it
+   *   - signal SNR is not poor
+   *   - temporal signal is not unstable
+   *   - acquisition is usable
+   *
+   * This deliberately favors "RETRY" over a fabricated precise number.
+   */
+  const validMethodCount = [
+    results.g,
+    results.chrom,
+    results.pos,
+    results.vitallens,
+  ].filter((r) => r.bpm >= MIN_BPM && r.bpm <= MAX_BPM).length;
 
-  if (confidenceTier === "LOW") {
+  const consensusAvailable =
+    comparison.consensusBpm >= MIN_BPM && comparison.consensusBpm <= MAX_BPM;
+
+  let decision: DecisionOutcome = "ACCEPT";
+
+  let decisionReason =
+    "Strong multi-method agreement, adequate signal quality, and stable temporal waveform passed the measurement gates.";
+
+  if (
+    !consensusAvailable ||
+    validMethodCount < 2 ||
+    confidenceTier === "LOW" ||
+    avgSnrDb < 0 ||
+    temporal.status === "UNSTABLE"
+  ) {
     decision = "RETRY";
-    decisionReason =
-      retryReasons.length > 0
-        ? `The rPPG methods do not show sufficient reliability: ${retryReasons.join("; ")}. A repeat scan is recommended.`
-        : "The optical pulse signals did not achieve sufficient stability and algorithm consensus. Please repeat the measurement.";
+
+    if (!retryReasons.length) {
+      retryReasons.push(
+        "Insufficient independent evidence for a reliable BPM estimate",
+      );
+    }
+
+    decisionReason = `The rPPG measurement did not pass the reliability gates: ${retryReasons.join("; ")}. A repeat scan is recommended.`;
   } else if (confidenceTier === "MEDIUM") {
     decision = "CAUTION";
+
     decisionReason =
-      "Measurement is usable with caution. Moderate algorithm variance or minor movement detected.";
+      "The signal produced a usable estimate, but some quality indicators remain moderate. Repeat the scan for a stronger measurement.";
   }
 
   const isReliable = decision === "ACCEPT";
-  const qualityTimeline = generateQualityTimeline(samples, sampleRate, 5);
+
+  const qualityTimeline = generateQualityTimeline(samples, actualRate, 5);
 
   return {
     overall,
@@ -727,7 +1477,7 @@ export function evaluateSignalQuality(
     lightingQuality: illuminationScore,
     motionStability: motionScore,
     motionQuality: motionScore,
-    waveformSNR: parseFloat(avgSnrDb.toFixed(1)),
+    waveformSNR: Number(avgSnrDb.toFixed(1)),
     snrScore,
     temporalStability: temporal.score,
     temporalStabilityStatus: temporal.status,
@@ -741,52 +1491,56 @@ export function evaluateSignalQuality(
   };
 }
 
-/**
- * Cardiovascular Risk Screening Layer (Improvement #10, #18, #30)
- * Only applied when measurement is reliable; separated from raw physiological metrics.
- */
+/* -------------------------------------------------------------------------- */
+/* Cardiovascular screening                                                    */
+/* -------------------------------------------------------------------------- */
+
 export function determineCardiovascularRisk(
   bpm: number,
   rmssd: number,
   rr: number,
-  quality: SignalQuality
+  quality: SignalQuality,
 ): { riskLevel: RiskLevel; riskScore: number } {
-  // If decision is RETRY, default to lower neutral triage score to prevent false alarm
-  if (quality.decision === 'RETRY') {
+  /*
+   * A rejected optical measurement must not be turned into a physiological
+   * risk conclusion.
+   */
+  if (quality.decision === "RETRY" || !quality.isReliable) {
     return {
-      riskLevel: 'lower',
-      riskScore: 20,
+      riskLevel: "lower",
+      riskScore: 0,
     };
   }
 
-  let score = 20; // baseline healthy score
+  let score = 20;
 
-  // Heart Rate analysis
+  /*
+   * This remains a screening/triage heuristic, not a diagnosis.
+   */
   if (bpm > 100) {
-    score += 30; // resting tachycardia
+    score += 30;
   } else if (bpm > 85) {
     score += 15;
   } else if (bpm < 50) {
-    score += 15; // resting bradycardia
+    score += 15;
   }
 
-  // HRV autonomic tone
   if (rmssd < 20) {
-    score += 30; // severe autonomic strain / low vagal modulation
+    score += 30;
   } else if (rmssd < 30) {
     score += 15;
   }
 
-  // Respiration rate
   if (rr > 22 || rr < 10) {
     score += 15;
   }
 
-  let riskLevel: RiskLevel = 'lower';
+  let riskLevel: RiskLevel = "lower";
+
   if (score >= 60) {
-    riskLevel = 'higher';
+    riskLevel = "higher";
   } else if (score >= 38) {
-    riskLevel = 'moderate';
+    riskLevel = "moderate";
   }
 
   return {
